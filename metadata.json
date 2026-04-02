@@ -1,0 +1,5 @@
+{
+  "name": "SkyCast AI",
+  "description": "A smart weather forecasting app with Gemini-powered insights and favorite cities tracking.",
+  "requestFramePermissions": ["geolocation"]
+}

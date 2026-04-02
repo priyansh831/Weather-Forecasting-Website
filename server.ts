@@ -17,11 +17,22 @@ app.use(express.json());
 
 // MongoDB Connection
 const MONGO_URI = process.env.MONGO_URI;
+let dbStatus = 'Disconnected';
+
 if (MONGO_URI) {
-  mongoose.connect(MONGO_URI)
-    .then(() => console.log('Connected to MongoDB'))
-    .catch(err => console.error('MongoDB connection error:', err));
+  mongoose.connect(MONGO_URI, {
+    serverSelectionTimeoutMS: 5000, // Timeout after 5s instead of 30s
+  })
+    .then(() => {
+      dbStatus = 'Connected';
+      console.log('Connected to MongoDB');
+    })
+    .catch(err => {
+      dbStatus = 'Error';
+      console.error('MongoDB connection error:', err.message);
+    });
 } else {
+  dbStatus = 'Missing URI';
   console.warn('MONGO_URI not found in environment variables. Favorites feature will not persist.');
 }
 
@@ -57,6 +68,18 @@ const MOCK_WEATHER = {
 };
 
 // API Routes
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    database: dbStatus,
+    env: {
+      hasMongoUri: !!process.env.MONGO_URI,
+      hasOpenWeatherKey: !!process.env.OPENWEATHER_API_KEY,
+      hasGeminiKey: !!process.env.GEMINI_API_KEY
+    }
+  });
+});
+
 app.get('/api/weather', async (req, res) => {
   const { city, lat, lon, demo } = req.query;
   const apiKey = process.env.OPENWEATHER_API_KEY;
@@ -122,24 +145,94 @@ app.post('/api/ai-insights', async (req, res) => {
     const text = result.text;
     res.json(JSON.parse(text || '{}'));
   } catch (error: any) {
-    console.error('Gemini Error:', error);
-    res.status(500).json({ error: 'Failed to generate AI insights' });
+    console.error('Gemini Error:', error.message || error);
+    
+    // Fallback insights if API key is invalid or other error occurs
+    const fallbackInsights = {
+      remark: "The AI is currently taking a coffee break, but the weather looks interesting!",
+      recommendation: "Wear whatever makes you feel like a weather pro today."
+    };
+    
+    if (error.message?.includes('API key not valid') || error.message?.includes('INVALID_ARGUMENT')) {
+      return res.json({ 
+        ...fallbackInsights, 
+        warning: 'Invalid Gemini API key. Showing fallback insights.' 
+      });
+    }
+    
+    res.status(500).json({ error: 'Failed to generate AI insights', details: error.message });
+  }
+});
+
+app.get('/api/forecast', async (req, res) => {
+  const { city, lat, lon, demo } = req.query;
+  const apiKey = process.env.OPENWEATHER_API_KEY;
+
+  if (demo === 'true') {
+    // Mock forecast data
+    const mockForecast = Array.from({ length: 5 }).map((_, i) => ({
+      dt: Math.floor(Date.now() / 1000) + (i + 1) * 86400,
+      main: { temp_max: 30 - i, temp_min: 20 - i },
+      weather: [{ main: 'Clear', icon: '01d' }]
+    }));
+    return res.json({ list: mockForecast });
+  }
+
+  if (!apiKey) {
+    return res.status(500).json({ error: 'OpenWeather API key is missing' });
+  }
+
+  try {
+    let url = '';
+    if (city) {
+      url = `https://api.openweathermap.org/data/2.5/forecast?q=${city}&units=metric&appid=${apiKey}`;
+    } else if (lat && lon) {
+      url = `https://api.openweathermap.org/data/2.5/forecast?lat=${lat}&lon=${lon}&units=metric&appid=${apiKey}`;
+    } else {
+      return res.status(400).json({ error: 'City or coordinates required' });
+    }
+
+    const response = await axios.get(url);
+    
+    // Process data to get one entry per day (OpenWeather 5-day returns 3-hour intervals)
+    const dailyData: any[] = [];
+    const seenDates = new Set();
+    
+    response.data.list.forEach((item: any) => {
+      const date = new Date(item.dt * 1000).toLocaleDateString();
+      if (!seenDates.has(date) && dailyData.length < 5) {
+        seenDates.add(date);
+        dailyData.push(item);
+      }
+    });
+
+    res.json({ list: dailyData });
+  } catch (error: any) {
+    res.status(error.response?.status || 500).json({ error: error.message });
   }
 });
 
 // Favorites CRUD
 app.get('/api/favorites', async (req, res) => {
+  if (dbStatus !== 'Connected') {
+    return res.status(503).json({ error: `Database not connected: ${dbStatus}` });
+  }
   try {
     const favorites = await Favorite.find().sort({ createdAt: -1 });
     res.json(favorites);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch favorites' });
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to fetch favorites', details: error.message });
   }
 });
 
 app.post('/api/favorites', async (req, res) => {
+  if (dbStatus !== 'Connected') {
+    return res.status(503).json({ error: `Database not connected: ${dbStatus}` });
+  }
   try {
     const { name } = req.body;
+    if (!name) return res.status(400).json({ error: 'City name is required' });
+    
     const favorite = new Favorite({ name });
     await favorite.save();
     res.json(favorite);
@@ -147,7 +240,7 @@ app.post('/api/favorites', async (req, res) => {
     if (error.code === 11000) {
       return res.status(400).json({ error: 'City already in favorites' });
     }
-    res.status(500).json({ error: 'Failed to add favorite' });
+    res.status(500).json({ error: 'Failed to add favorite', details: error.message });
   }
 });
 
